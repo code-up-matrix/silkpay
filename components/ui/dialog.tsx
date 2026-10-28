@@ -22,6 +22,7 @@ export function Dialog({
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="dialog-overlay" />
         <DialogPrimitive.Content
+          {...(!description ? { "aria-describedby": undefined } : {})}
           className={`dialog-content ${wide ? "dialog-wide" : ""}`}
         >
           <div className="dialog-heading">

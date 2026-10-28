@@ -7,6 +7,10 @@ A Next.js application for US buyers and Asian manufacturers to agree on purchase
 **Deployment:** https://silkpay-codeup.vercel.app  
 **Repository:** https://github.com/code-up-matrix/silkpay
 
+![SilkPay sample dashboard](docs/dashboard.jpg)
+
+[Verification details](docs/VERIFICATION.md)
+
 ## What the payment flow actually does
 
 PayPal Orders v2 creates an `AUTHORIZE` order. The buyer approves it on `www.sandbox.paypal.com`; the server verifies the exact merchant, milestone ID, currency and amount, then confirms the authorization. A passing evidence review permits a **final capture** through Payments v2. Automatic capture requires the buyer's explicit opt-in before authorization. Otherwise, the buyer confirms settlement.

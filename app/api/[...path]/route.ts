@@ -239,8 +239,27 @@ async function route(request: Request, context: Context): Promise<Response> {
         request,
         z.object({ autoSettle: z.boolean(), accepted: z.literal(true) }),
       );
-      if (m.status === "approval_pending" && m.approval_url)
+      if (m.status === "approval_pending" && m.approval_url) {
+        const changed = await query(
+          "UPDATE milestones SET auto_settle=$2 WHERE id=$1 AND status='approval_pending' AND authorization_id IS NULL RETURNING id",
+          [m.id, input.autoSettle],
+        );
+        if (!changed.length)
+          throw new HttpError(
+            409,
+            "Payment approval changed. Refresh this milestone.",
+          );
+        if (input.autoSettle !== m.auto_settle)
+          await audit(
+            m.order_id,
+            "Settlement instruction updated",
+            input.autoSettle
+              ? "Buyer enabled automatic settlement after review."
+              : "Buyer confirmation is required before settlement.",
+            "Buyer",
+          );
         return json({ url: m.approval_url });
+      }
       const [locked] = await query<Milestone>(
         "UPDATE milestones SET status='approval_pending',auto_settle=$2,lock_until=now()+interval '2 minutes' WHERE id=$1 AND status IN ('unfunded','approval_pending') AND paypal_order_id IS NULL AND (lock_until IS NULL OR lock_until<now()) RETURNING *",
         [m.id, input.autoSettle],
@@ -321,39 +340,56 @@ async function route(request: Request, context: Context): Promise<Response> {
           409,
           "The authorization is still within its three-day honor period.",
         );
-      const a = await paypal<ProviderPayment>(
-        "/v2/payments/authorizations/" +
-          providerId(m.authorization_id) +
-          "/reauthorize",
-        "POST",
-        {
-          amount: {
-            currency_code: "USD",
-            value: (m.amount_cents / 100).toFixed(2),
-          },
-        },
-        requestId("reauthorize", m.authorization_id),
+      const [refreshLock] = await query(
+        "UPDATE milestones SET lock_until=now()+interval '2 minutes' WHERE id=$1 AND authorization_id=$2 AND status IN ('funded','changes_requested','verified') AND (lock_until IS NULL OR lock_until<now()) RETURNING id",
+        [m.id, m.authorization_id],
       );
-      if (
-        a.status !== "CREATED" ||
-        !matchesAmount(a.amount, m.amount_cents) ||
-        !a.expiration_time
-      )
+      if (!refreshLock)
         throw new HttpError(
           409,
-          "PayPal has not confirmed the refreshed authorization.",
+          "Another milestone action is in progress. Refresh before retrying.",
         );
-      await query(
-        "UPDATE milestones SET authorization_id=$2,authorized_at=now(),authorization_expires_at=$3 WHERE id=$1 AND authorization_id=$4",
-        [m.id, providerId(a.id), a.expiration_time, m.authorization_id],
-      );
-      await audit(
-        m.order_id,
-        "Authorization refreshed",
-        m.title + " · capture honor period refreshed.",
-        "Buyer",
-      );
-      return json({ ok: true });
+      try {
+        const a = await paypal<ProviderPayment>(
+          "/v2/payments/authorizations/" +
+            providerId(m.authorization_id) +
+            "/reauthorize",
+          "POST",
+          {
+            amount: {
+              currency_code: "USD",
+              value: (m.amount_cents / 100).toFixed(2),
+            },
+          },
+          requestId("reauthorize", m.authorization_id),
+        );
+        if (
+          a.status !== "CREATED" ||
+          !matchesAmount(a.amount, m.amount_cents) ||
+          !a.expiration_time ||
+          !Number.isFinite(Date.parse(a.expiration_time))
+        )
+          throw new HttpError(
+            409,
+            "PayPal has not confirmed the refreshed authorization.",
+          );
+        await query(
+          "UPDATE milestones SET authorization_id=$2,authorized_at=now(),authorization_expires_at=$3,lock_until=NULL WHERE id=$1 AND authorization_id=$4",
+          [m.id, providerId(a.id), a.expiration_time, m.authorization_id],
+        );
+        await audit(
+          m.order_id,
+          "Authorization refreshed",
+          m.title + " · capture honor period refreshed.",
+          "Buyer",
+        );
+        return json({ ok: true });
+      } finally {
+        await query(
+          "UPDATE milestones SET lock_until=NULL WHERE id=$1 AND authorization_id=$2 AND status IN ('funded','changes_requested','verified')",
+          [m.id, m.authorization_id],
+        );
+      }
     }
     if (action === "settle") return json(await settle(m, "Buyer"));
     if (action === "dispute") {
@@ -362,7 +398,7 @@ async function route(request: Request, context: Context): Promise<Response> {
         z.object({ reason: z.string().trim().min(10).max(1500) }),
       );
       const changed = await query(
-        "UPDATE milestones SET status='disputed',payment_error=$2 WHERE id=$1 AND status IN ('unfunded','funded','changes_requested','verified') AND capture_id IS NULL RETURNING id",
+        "UPDATE milestones SET status='disputed',payment_error=$2 WHERE id=$1 AND status IN ('unfunded','funded','changes_requested','verified') AND capture_id IS NULL AND (lock_until IS NULL OR lock_until<now()) RETURNING id",
         [m.id, input.reason],
       );
       if (!changed.length)
@@ -457,7 +493,7 @@ async function review(m: Milestone, who: Workspace) {
     throw new HttpError(503, "The AI reviewer is not connected yet.");
   const reviewLock = randomUUID();
   const [locked] = await query<Milestone>(
-    "UPDATE milestones SET status='reviewing',review_lock=$2,lock_until=now()+interval '2 minutes' WHERE id=$1 AND (status IN ('funded','changes_requested','verified') OR (status='reviewing' AND lock_until<now())) AND evidence_count>0 RETURNING *",
+    "UPDATE milestones SET status='reviewing',review_lock=$2,lock_until=now()+interval '2 minutes' WHERE id=$1 AND ((status IN ('funded','changes_requested','verified') AND (lock_until IS NULL OR lock_until<now())) OR (status='reviewing' AND lock_until<now())) AND evidence_count>0 RETURNING *",
     [m.id, reviewLock],
   );
   if (!locked)

@@ -31,7 +31,7 @@ export async function settle(m: Milestone, actor: string, automatic = false) {
       "The buyer must refresh the authorization before settlement; its three-day honor period has elapsed.",
     );
   const [locked] = await query<Milestone>(
-    "UPDATE milestones SET status='settling',lock_until=now()+interval '2 minutes',payment_error=NULL WHERE id=$1 AND status='verified' AND review_version=evidence_version AND review->>'passed'='true' AND ($2=false OR auto_settle=true) RETURNING *",
+    "UPDATE milestones SET status='settling',lock_until=now()+interval '2 minutes',payment_error=NULL WHERE id=$1 AND status='verified' AND review_version=evidence_version AND review->>'passed'='true' AND ($2=false OR auto_settle=true) AND (lock_until IS NULL OR lock_until<now()) RETURNING *",
     [m.id, automatic],
   );
   if (!locked)
@@ -147,10 +147,16 @@ export async function reconcile(m: Milestone) {
     );
     return { status: "expired" };
   }
-  if (auth?.status === "CREATED" && m.status === "settlement_pending") {
+  if (
+    auth?.status === "CREATED" &&
+    (m.status === "settlement_pending" ||
+      (m.status === "settling" &&
+        m.lock_until &&
+        Date.parse(m.lock_until) < Date.now()))
+  ) {
     // A final capture cannot be repeated: reuse the same provider idempotency key.
     const [retry] = await query<Milestone>(
-      "UPDATE milestones SET status='verified',lock_until=NULL WHERE id=$1 AND status='settlement_pending' AND capture_id IS NULL AND review_version=evidence_version RETURNING *",
+      "UPDATE milestones SET status='verified',lock_until=NULL WHERE id=$1 AND (status='settlement_pending' OR (status='settling' AND lock_until<now())) AND capture_id IS NULL AND review_version=evidence_version RETURNING *",
       [m.id],
     );
     if (retry) return settle(retry, "Reconciliation", false);

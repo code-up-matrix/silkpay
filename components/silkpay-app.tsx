@@ -178,7 +178,7 @@ export function SilkPayApp() {
     [loading, setLoading] = useState(true);
   const [invite, setInvite] = useState(""),
     [accepted, setAccepted] = useState(false),
-    [autoSettle, setAutoSettle] = useState(true);
+    [autoSettle, setAutoSettle] = useState(false);
   const sample = data.mode === "sample",
     buyer = data.workspace?.role !== "supplier";
   const order = data.orders.find((o) => o.id === orderId),
@@ -237,11 +237,13 @@ export function SilkPayApp() {
     }
   }
   function openOrder(o: PurchaseOrder, m?: Milestone) {
+    window.scrollTo({ top: 0, behavior: "auto" });
     setOrderId(o.id);
     setMilestoneId(m?.id || null);
     setMobileNav(false);
   }
   function go(next: View) {
+    window.scrollTo({ top: 0, behavior: "auto" });
     setView(next);
     setOrderId(null);
     setMobileNav(false);
@@ -250,6 +252,7 @@ export function SilkPayApp() {
   }
   function action(next: Modal) {
     setAccepted(false);
+    setAutoSettle(false);
     setInvite("");
     setModal(sample && next !== "help" && next !== "settings" ? "start" : next);
   }

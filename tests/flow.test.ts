@@ -238,6 +238,16 @@ beforeEach(async () => {
           ],
         });
       }
+      if (url.endsWith("/reauthorize")) {
+        const refreshed = {
+          id: "TESTAUTH0002",
+          status: "CREATED",
+          amount: { currency_code: "USD", value: "100.00" },
+          expiration_time: new Date(Date.now() + 25 * 86400000).toISOString(),
+        };
+        provider.purchase_units[0].payments!.authorizations = [refreshed];
+        return Response.json(refreshed);
+      }
       if (url.endsWith("/authorize")) {
         provider.status = "COMPLETED";
         provider.purchase_units[0].payments = {
@@ -410,6 +420,79 @@ describe("private workspace and supplier boundaries", () => {
   });
 });
 describe("authorization → evidence → verification → settlement", () => {
+  it("honors changed settlement consent when resuming a cancelled approval", async () => {
+    const b = await buyer(),
+      o = await order(b),
+      s = await supplier(b, o),
+      m = o.milestones[0];
+    await request(`milestones/${m.id}/fund`, "POST", b, {
+      accepted: true,
+      autoSettle: true,
+    });
+    await request(`milestones/${m.id}/fund`, "POST", b, {
+      accepted: true,
+      autoSettle: false,
+    });
+    provider.status = "APPROVED";
+    await request(`milestones/${m.id}/authorize`, "POST", b, {
+      orderId: provider.id,
+    });
+    await upload(s.cookie, m);
+    await request(`milestones/${m.id}/review`, "POST", s.cookie, {});
+    const saved = (await workspace(b)).orders[0].milestones[0];
+    expect(saved.auto_settle).toBe(false);
+    expect(saved.status).toBe("verified");
+    expect(providerCalls.some((c) => c.url.endsWith("/capture"))).toBe(false);
+  });
+  it("recovers an interrupted settlement only after its lease expires", async () => {
+    const { b, s, m } = await setup();
+    await request(`milestones/${m.id}/review`, "POST", s.cookie, {});
+    await state.db.query(
+      "UPDATE milestones SET status='settling',lock_until=now()+interval '2 minutes' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (await request(`milestones/${m.id}/reconcile`, "POST", b, {})).status,
+    ).toBe(200);
+    expect(providerCalls.some((c) => c.url.endsWith("/capture"))).toBe(false);
+    await state.db.query(
+      "UPDATE milestones SET lock_until=now()-interval '1 second' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (await request(`milestones/${m.id}/reconcile`, "POST", b, {})).status,
+    ).toBe(200);
+    expect((await workspace(b)).orders[0].milestones[0].status).toBe("settled");
+    expect(
+      providerCalls.filter((c) => c.url.endsWith("/capture")),
+    ).toHaveLength(1);
+  });
+  it("blocks review, capture and authorization refresh during another payment lease", async () => {
+    const { b, s, m } = await setup();
+    await request(`milestones/${m.id}/review`, "POST", s.cookie, {});
+    await state.db.query(
+      "UPDATE milestones SET lock_until=now()+interval '2 minutes' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (await request(`milestones/${m.id}/review`, "POST", s.cookie, {})).status,
+    ).toBe(409);
+    expect(
+      (await request(`milestones/${m.id}/settle`, "POST", b, {})).status,
+    ).toBe(409);
+    await state.db.query(
+      "UPDATE milestones SET authorized_at=now()-interval '4 days' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (await request(`milestones/${m.id}/reauthorize`, "POST", b, {})).status,
+    ).toBe(409);
+    expect(
+      providerCalls.some(
+        (c) => c.url.endsWith("/capture") || c.url.endsWith("/reauthorize"),
+      ),
+    ).toBe(false);
+  });
   it("completes manual settlement with exactly one confirmed final capture", async () => {
     const { b, s, m } = await setup();
     expect(
@@ -563,6 +646,26 @@ describe("authorization → evidence → verification → settlement", () => {
       (await request(`milestones/${m.id}/settle`, "POST", b, {})).status,
     ).toBe(409);
     expect(providerCalls.some((c) => c.url.endsWith("/capture"))).toBe(false);
+  });
+  it("refreshes an older authorization before capturing with the new reference", async () => {
+    const { b, s, m } = await setup();
+    await request(`milestones/${m.id}/review`, "POST", s.cookie, {});
+    await state.db.query(
+      "UPDATE milestones SET authorized_at=now()-interval '4 days' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (await request(`milestones/${m.id}/reauthorize`, "POST", b, {})).status,
+    ).toBe(200);
+    const updated = (await workspace(b)).orders[0].milestones[0];
+    expect(updated.authorization_id).toBe("TESTAUTH0002");
+    expect(updated.lock_until).toBeNull();
+    expect(
+      (await request(`milestones/${m.id}/settle`, "POST", b, {})).status,
+    ).toBe(200);
+    expect(
+      providerCalls.find((c) => c.url.endsWith("/capture"))?.url,
+    ).toContain("/TESTAUTH0002/capture");
   });
   it("keeps pending captures pending until PayPal confirms completion", async () => {
     const { b, s, m } = await setup(true);
