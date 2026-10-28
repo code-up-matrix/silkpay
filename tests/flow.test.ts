@@ -59,6 +59,11 @@ vi.mock("@/lib/review", () => ({
     };
   },
 }));
+import { POST as createCheckout } from "@/app/api/paypal/create-order/route";
+import { POST as approveCheckout } from "@/app/api/paypal/approve-order/route";
+import { POST as captureCheckout } from "@/app/api/paypal/capture-order/route";
+import { POST as verifyAgent } from "@/app/api/agent/verify/route";
+import { POST as seedOrder } from "@/app/api/orders/seed/route";
 import { GET, POST, DELETE } from "@/app/api/[...path]/route";
 import { validateOrder, PAYPAL_BASE, requestId } from "@/lib/paypal";
 import type { ProviderOrder } from "@/lib/paypal";
@@ -94,6 +99,14 @@ async function request(
       ? { body: multipart ? data : JSON.stringify(data) }
       : {}),
   });
+  const named: Record<string, (r: Request) => Promise<Response>> = {
+    "paypal/create-order": createCheckout,
+    "paypal/approve-order": approveCheckout,
+    "paypal/capture-order": captureCheckout,
+    "agent/verify": verifyAgent,
+    "orders/seed": seedOrder,
+  };
+  if (named[path] && method === "POST") return named[path](req);
   return (method === "POST" ? POST : method === "DELETE" ? DELETE : GET)(req, {
     params: Promise.resolve({ path: path.split("/") }),
   });
@@ -225,6 +238,7 @@ beforeEach(async () => {
       if (url.endsWith("/v1/notifications/verify-webhook-signature"))
         return Response.json({ verification_status: webhookMode });
       if (url.endsWith("/v2/checkout/orders") && method === "POST") {
+        provider.intent = body.intent;
         provider.purchase_units = body.purchase_units;
         return Response.json({
           ...provider,
@@ -272,7 +286,15 @@ beforeEach(async () => {
           status: captureMode,
           amount: { currency_code: "USD", value: "100.00" },
         };
+        provider.purchase_units[0].payments ||= {};
         provider.purchase_units[0].payments!.captures = [capture];
+        if (url.includes("/v2/checkout/orders/")) {
+          provider.status = "COMPLETED";
+          return Response.json({
+            id: provider.id,
+            purchase_units: [{ payments: { captures: [capture] } }],
+          });
+        }
         return Response.json(capture);
       }
       if (url.endsWith("/TESTORDER0001") && method === "GET")
@@ -804,5 +826,301 @@ describe("PayPal webhook validation", () => {
     expect(requestId("capture", "same")).not.toBe(
       requestId("authorize", "same"),
     );
+  });
+});
+
+describe("Orders v2 CAPTURE checkout and isolated demo inspection", () => {
+  async function captureSetup() {
+    const b = await buyer(),
+      o = await order(b),
+      m = o.milestones[0],
+      s = await supplier(b, o);
+    const created = await request("paypal/create-order", "POST", b, {
+      milestoneId: m.id,
+      accepted: true,
+    });
+    expect(created.status).toBe(200);
+    expect(provider.intent).toBe("CAPTURE");
+    provider.status = "APPROVED";
+    expect(
+      (
+        await request("paypal/approve-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(200);
+    await upload(s.cookie, m);
+    return { b, o, m, s };
+  }
+  it("seeds the exact blueprint idempotently within each private workspace", async () => {
+    const b = await buyer("Apex Goods LLC");
+    expect((await request("orders/seed", "POST", b, {})).status).toBe(201);
+    await request("orders/seed", "POST", b, {});
+    const w = await workspace(b);
+    expect(w.orders).toHaveLength(1);
+    expect(w.orders[0]).toMatchObject({
+      number: "SK-8821",
+      quantity: 5000,
+      total_cents: 450000,
+      buyer: "Apex Goods LLC",
+    });
+    expect(w.orders[0].milestones[0]).toMatchObject({
+      position: 1,
+      payment_intent: "CAPTURE",
+      amount_cents: 450000,
+    });
+    const other = await buyer("Another buyer");
+    expect((await request("orders/seed", "POST", other, {})).status).toBe(201);
+    expect((await workspace(other)).orders[0].id).not.toBe(w.orders[0].id);
+  });
+  it("rejects browser prices, foreign sessions and supplier payment instructions", async () => {
+    const b = await buyer(),
+      o = await order(b),
+      m = o.milestones[0],
+      s = await supplier(b, o),
+      other = await buyer();
+    expect(
+      (
+        await request("paypal/create-order", "POST", b, {
+          milestoneId: m.id,
+          accepted: true,
+          amount: "0.01",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await request("paypal/create-order", "POST", s.cookie, {
+          milestoneId: m.id,
+          accepted: true,
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request("paypal/create-order", "POST", other, {
+          milestoneId: m.id,
+          accepted: true,
+        })
+      ).status,
+    ).toBe(404);
+    expect(providerCalls).toHaveLength(0);
+  });
+  it("records approval without claiming a hold and captures once after real-path inspection", async () => {
+    const { b, s, m } = await captureSetup();
+    let saved = (await workspace(b)).orders[0].milestones[0];
+    expect(saved.status).toBe("checkout_approved");
+    expect(saved.authorization_id).toBeNull();
+    expect(saved.approved_at).toBeTruthy();
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+    const review = await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    expect(await review.json()).toMatchObject({
+      verified: true,
+      readyForPayout: true,
+      engine: "ai",
+    });
+    const captured = await request("paypal/capture-order", "POST", b, {
+      milestoneId: m.id,
+      orderId: provider.id,
+    });
+    expect(captured.status).toBe(200);
+    expect(await captured.json()).toMatchObject({
+      status: "settled",
+      captureId: "TESTCAPTURE01",
+    });
+    const repeated = await request("paypal/capture-order", "POST", b, {
+      milestoneId: m.id,
+      orderId: provider.id,
+    });
+    expect(await repeated.json()).toMatchObject({ alreadyCaptured: true });
+    const captures = providerCalls.filter((c) => c.url.endsWith("/capture"));
+    expect(captures).toHaveLength(1);
+    expect(captures[0].url).toBe(
+      PAYPAL_BASE + "/v2/checkout/orders/TESTORDER0001/capture",
+    );
+    saved = (await workspace(b)).orders[0].milestones[0];
+    expect(saved.status).toBe("settled");
+  });
+  it("cannot turn a passing demo result into payment permission", async () => {
+    const { b, m } = await captureSetup();
+    const demo = await request("agent/verify", "POST", "", {
+      mode: "demo",
+      fixtures: ["inspection", "manifest", "labels"],
+    });
+    expect(await demo.json()).toMatchObject({
+      verified: true,
+      readyForPayout: true,
+      mode: "demo",
+      engine: "deterministic-demo",
+    });
+    expect((await workspace(b)).orders[0].milestones[0].review).toBeNull();
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+    expect(providerCalls.some((c) => c.url.endsWith("/capture"))).toBe(false);
+  });
+  it("returns a graceful held report when AI fails, without changing payout eligibility", async () => {
+    const { b, s, m } = await captureSetup();
+    state.review = "error";
+    const review = await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    expect(review.status).toBe(200);
+    expect(await review.json()).toMatchObject({
+      verified: false,
+      score: 0,
+      readyForPayout: false,
+      engine: "held-fallback",
+    });
+    expect((await workspace(b)).orders[0].milestones[0].status).toBe(
+      "checkout_approved",
+    );
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+  });
+  it("invalidates a CAPTURE review when supplier evidence changes", async () => {
+    const { b, s, m } = await captureSetup();
+    await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    await upload(s.cookie, m, "New shipment record changes the evidence.");
+    const saved = (await workspace(b)).orders[0].milestones[0];
+    expect(saved.status).toBe("checkout_approved");
+    expect(saved.review).toBeNull();
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+  });
+  it("rejects wrong checkout references and approvals not confirmed by PayPal", async () => {
+    const b = await buyer(),
+      o = await order(b),
+      m = o.milestones[0];
+    await request("paypal/create-order", "POST", b, {
+      milestoneId: m.id,
+      accepted: true,
+    });
+    expect(
+      (
+        await request("paypal/approve-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: "WRONGORDER01",
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await request("paypal/approve-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+    expect((await workspace(b)).orders[0].milestones[0].approved_at).toBeNull();
+  });
+  it("keeps pending captures pending until confirmed", async () => {
+    const { b, s, m } = await captureSetup();
+    await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    captureMode = "PENDING";
+    const r = await request("paypal/capture-order", "POST", b, {
+      milestoneId: m.id,
+      orderId: provider.id,
+    });
+    expect(await r.json()).toMatchObject({ status: "settlement_pending" });
+    provider.purchase_units[0].payments!.captures![0].status = "COMPLETED";
+    await request(`milestones/${m.id}/reconcile`, "POST", b, {});
+    expect((await workspace(b)).orders[0].milestones[0].status).toBe("settled");
+  });
+  it("retries a lost capture response with the same idempotency key", async () => {
+    const { b, s, m } = await captureSetup();
+    await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    captureMode = "NETWORK_ERROR";
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(500);
+    captureMode = "COMPLETED";
+    await request(`milestones/${m.id}/reconcile`, "POST", b, {});
+    expect((await workspace(b)).orders[0].milestones[0].status).toBe("settled");
+    const calls = providerCalls.filter((c) => c.url.endsWith("/capture"));
+    expect(calls).toHaveLength(2);
+    expect(calls[0].headers["PayPal-Request-Id"]).toBe(
+      calls[1].headers["PayPal-Request-Id"],
+    );
+  });
+  it("blocks expired checkouts and concurrent captures", async () => {
+    const { b, s, m } = await captureSetup();
+    await request("agent/verify", "POST", s.cookie, {
+      mode: "sandbox",
+      milestoneId: m.id,
+    });
+    await state.db.query(
+      "UPDATE milestones SET checkout_expires_at=now()-interval '1 minute' WHERE id=$1",
+      [m.id],
+    );
+    expect(
+      (
+        await request("paypal/capture-order", "POST", b, {
+          milestoneId: m.id,
+          orderId: provider.id,
+        })
+      ).status,
+    ).toBe(409);
+    await state.db.query(
+      "UPDATE milestones SET checkout_expires_at=now()+interval '1 hour' WHERE id=$1",
+      [m.id],
+    );
+    const rs = await Promise.all([
+      request("paypal/capture-order", "POST", b, {
+        milestoneId: m.id,
+        orderId: provider.id,
+      }),
+      request("paypal/capture-order", "POST", b, {
+        milestoneId: m.id,
+        orderId: provider.id,
+      }),
+    ]);
+    expect(rs.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(
+      providerCalls.filter((c) => c.url.endsWith("/capture")),
+    ).toHaveLength(1);
   });
 });

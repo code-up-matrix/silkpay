@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
+import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 const config: NextConfig = {
   poweredByHeader: false,
+  devIndicators: false,
   async headers() {
     return [
       {
@@ -18,4 +20,7 @@ const config: NextConfig = {
     ];
   },
 };
-export default config;
+export default (phase: string): NextConfig => ({
+  ...config,
+  distDir: phase === PHASE_DEVELOPMENT_SERVER ? ".next-dev" : ".next",
+});

@@ -2,7 +2,7 @@
 @theme {
   --color-primary: #003087;
   --color-secondary: #0070ba;
-  --font-sans: "Inter", "Segoe UI", Arial, sans-serif;
+  --font-sans: "Inter Variable", "Inter", "Segoe UI", Arial, sans-serif;
 }
 :root {
   --navy: #003087;

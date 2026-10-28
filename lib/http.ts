@@ -25,9 +25,10 @@ export function json(value: unknown, status = 200) {
 }
 export function origin(request: Request) {
   const expected =
-    process.env.NODE_ENV === "production"
-      ? process.env.APP_ORIGIN
-      : new URL(request.url).origin;
+    process.env.APP_ORIGIN ||
+    (process.env.NODE_ENV !== "production"
+      ? new URL(request.url).origin
+      : undefined);
   const actual = request.headers.get("origin");
   if (!actual || !expected || actual !== expected)
     throw new HttpError(403, "This request must come from SilkPay.");

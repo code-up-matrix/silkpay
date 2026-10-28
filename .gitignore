@@ -6,3 +6,5 @@ node_modules/
 *.tsbuildinfo
 coverage/
 __pycache__/
+
+.next-dev/

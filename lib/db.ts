@@ -7,5 +7,7 @@ export async function query<T = Record<string, unknown>>(
   if (!process.env.DATABASE_URL)
     throw new Error("Database connection is not configured.");
   const sql = neon(process.env.DATABASE_URL);
-  return (await sql.query(text, params)) as T[];
+  return (await sql.query(text, params, {
+    fetchOptions: { signal: AbortSignal.timeout(20000) },
+  })) as T[];
 }

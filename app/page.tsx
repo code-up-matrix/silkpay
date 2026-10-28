@@ -1,4 +1,4 @@
-import { SilkPayApp } from "@/components/silkpay-app";
+import { TradeWorkspace } from "@/components/trade-workspace";
 export default function Page() {
-  return <SilkPayApp />;
+  return <TradeWorkspace />;
 }

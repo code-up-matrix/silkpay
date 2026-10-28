@@ -2,6 +2,7 @@ export type Role = "buyer" | "supplier";
 export type MilestoneStatus =
   | "unfunded"
   | "approval_pending"
+  | "checkout_approved"
   | "funded"
   | "reviewing"
   | "changes_requested"
@@ -49,6 +50,9 @@ export type Milestone = {
   authorized_at: string | null;
   payment_error: string | null;
   attempt_key: string;
+  payment_intent?: "AUTHORIZE" | "CAPTURE";
+  checkout_expires_at?: string | null;
+  approved_at?: string | null;
   approval_url?: string | null;
   lock_until?: string | null;
 };

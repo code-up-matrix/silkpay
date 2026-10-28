@@ -62,6 +62,7 @@ import type {
 } from "@/lib/types";
 
 const labels: Record<MilestoneStatus, string> = {
+  checkout_approved: "Checkout approved",
   unfunded: "Not authorized",
   approval_pending: "Awaiting approval",
   funded: "Authorized",

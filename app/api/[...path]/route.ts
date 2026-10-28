@@ -18,7 +18,7 @@ import {
 } from "@/lib/http";
 import { orderInput, validFile, matchesAmount } from "@/lib/policy";
 import { audit, ordersFor, ownedMilestone, ownedOrder } from "@/lib/repository";
-import { aiConfigured, reviewEvidence } from "@/lib/review";
+import { aiConfigured } from "@/lib/review";
 import {
   authorizePayment,
   createPayment,
@@ -28,6 +28,7 @@ import {
   requestId,
   type ProviderPayment,
 } from "@/lib/paypal";
+import { inspectMilestone } from "@/lib/inspection";
 import { reconcile, settle } from "@/lib/payments";
 import { sampleOrders } from "@/lib/sample";
 import type { Milestone, Workspace } from "@/lib/types";
@@ -215,7 +216,7 @@ async function route(request: Request, context: Context): Promise<Response> {
     if (method !== "POST")
       throw new HttpError(405, "Use POST for milestone actions.");
     if (action === "evidence") return upload(request, m, who);
-    if (action === "review") return review(m, who);
+    if (action === "review") return inspectMilestone(m, who);
     if (action === "reconcile") {
       if (!m.paypal_order_id)
         throw new HttpError(
@@ -230,6 +231,11 @@ async function route(request: Request, context: Context): Promise<Response> {
         "Only the buyer can change payment instructions.",
       );
     if (action === "fund") {
+      if (m.payment_intent === "CAPTURE" && m.paypal_order_id)
+        throw new HttpError(
+          409,
+          "Continue this milestone through the checkout workflow.",
+        );
       if (!paymentsConfigured())
         throw new HttpError(
           503,
@@ -298,6 +304,11 @@ async function route(request: Request, context: Context): Promise<Response> {
       }
     }
     if (action === "authorize") {
+      if (m.payment_intent === "CAPTURE")
+        throw new HttpError(
+          409,
+          "Confirm this CAPTURE order through the checkout approval endpoint.",
+        );
       const input = await body(
         request,
         z.object({ orderId: z.string().min(8).max(40) }),
@@ -398,7 +409,7 @@ async function route(request: Request, context: Context): Promise<Response> {
         z.object({ reason: z.string().trim().min(10).max(1500) }),
       );
       const changed = await query(
-        "UPDATE milestones SET status='disputed',payment_error=$2 WHERE id=$1 AND status IN ('unfunded','funded','changes_requested','verified') AND capture_id IS NULL AND (lock_until IS NULL OR lock_until<now()) RETURNING id",
+        "UPDATE milestones SET status='disputed',payment_error=$2 WHERE id=$1 AND status IN ('unfunded','funded','checkout_approved','changes_requested','verified') AND capture_id IS NULL AND (lock_until IS NULL OR lock_until<now()) RETURNING id",
         [m.id, input.reason],
       );
       if (!changed.length)
@@ -411,7 +422,7 @@ async function route(request: Request, context: Context): Promise<Response> {
     }
     if (action === "resolve") {
       const changed = await query(
-        "UPDATE milestones SET status=CASE WHEN authorization_id IS NULL THEN 'unfunded' ELSE 'funded' END,review=NULL,review_version=NULL,payment_error=NULL WHERE id=$1 AND status='disputed' AND capture_id IS NULL RETURNING id",
+        "UPDATE milestones SET status=CASE WHEN payment_intent='CAPTURE' AND approved_at IS NOT NULL THEN 'checkout_approved' WHEN authorization_id IS NULL THEN 'unfunded' ELSE 'funded' END,review=NULL,review_version=NULL,payment_error=NULL WHERE id=$1 AND status='disputed' AND capture_id IS NULL RETURNING id",
         [m.id],
       );
       if (!changed.length)
@@ -462,7 +473,7 @@ async function upload(request: Request, m: Milestone, who: Workspace) {
   const filename =
     file.name.replace(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 120) || "evidence";
   const rows = await query(
-    "WITH m AS (UPDATE milestones SET evidence_version=evidence_version+1,evidence_count=evidence_count+1,review=NULL,review_version=NULL,status=CASE WHEN status IN ('changes_requested','verified') THEN 'funded' ELSE status END WHERE id=$1 AND status IN ('unfunded','approval_pending','funded','changes_requested','verified') AND evidence_count<6 AND (lock_until IS NULL OR lock_until<now()) RETURNING id,order_id), e AS (INSERT INTO evidence(milestone_id,order_id,filename,media_type,size,sha256,content,note) SELECT id,order_id,$2,$3,$4,$5,decode($6,'hex'),$7 FROM m RETURNING id) SELECT * FROM e",
+    "WITH m AS (UPDATE milestones SET evidence_version=evidence_version+1,evidence_count=evidence_count+1,review=NULL,review_version=NULL,status=CASE WHEN status IN ('changes_requested','verified') THEN CASE WHEN payment_intent='CAPTURE' THEN 'checkout_approved' ELSE 'funded' END ELSE status END WHERE id=$1 AND status IN ('unfunded','approval_pending','funded','checkout_approved','changes_requested','verified') AND evidence_count<6 AND (lock_until IS NULL OR lock_until<now()) RETURNING id,order_id), e AS (INSERT INTO evidence(milestone_id,order_id,filename,media_type,size,sha256,content,note) SELECT id,order_id,$2,$3,$4,$5,decode($6,'hex'),$7 FROM m RETURNING id) SELECT * FROM e",
     [
       m.id,
       filename,
@@ -485,79 +496,6 @@ async function upload(request: Request, m: Milestone, who: Workspace) {
     "Supplier",
   );
   return json({ id: rows[0].id }, 201);
-}
-async function review(m: Milestone, who: Workspace) {
-  await limit("review:" + who.id, 6, 3600);
-  await limit("review:global", 30, 3600);
-  if (!(await aiConfigured()))
-    throw new HttpError(503, "The AI reviewer is not connected yet.");
-  const reviewLock = randomUUID();
-  const [locked] = await query<Milestone>(
-    "UPDATE milestones SET status='reviewing',review_lock=$2,lock_until=now()+interval '2 minutes' WHERE id=$1 AND ((status IN ('funded','changes_requested','verified') AND (lock_until IS NULL OR lock_until<now())) OR (status='reviewing' AND lock_until<now())) AND evidence_count>0 RETURNING *",
-    [m.id, reviewLock],
-  );
-  if (!locked)
-    throw new HttpError(
-      409,
-      "Authorize this milestone and upload evidence before requesting review.",
-    );
-  let committed = false;
-  try {
-    const report = await reviewEvidence(
-      await ownedOrder(m.order_id, who),
-      locked,
-    );
-    const [updated] = await query<Milestone>(
-      "UPDATE milestones SET status=$2,review=$3::jsonb,review_version=$4,lock_until=NULL,review_lock=NULL WHERE id=$1 AND status='reviewing' AND evidence_version=$4 AND review_lock=$5 RETURNING *",
-      [
-        m.id,
-        report.passed ? "verified" : "changes_requested",
-        JSON.stringify(report),
-        locked.evidence_version,
-        reviewLock,
-      ],
-    );
-    if (!updated)
-      throw new HttpError(409, "The evidence changed. Run a fresh review.");
-    committed = true;
-    await audit(
-      m.order_id,
-      report.passed ? "Evidence verified" : "More evidence requested",
-      report.summary,
-      "SilkPay AI",
-    );
-    if (report.passed && updated.auto_settle) {
-      try {
-        return json({
-          report,
-          settlement: await settle(updated, "SilkPay AI", true),
-        });
-      } catch (e) {
-        return json({
-          report,
-          settlement: {
-            status: "needs_attention",
-            message:
-              e instanceof HttpError
-                ? e.message
-                : "Settlement needs reconciliation. Refresh payment status.",
-          },
-        });
-      }
-    }
-    return json({ report });
-  } catch (e) {
-    if (!committed)
-      await query(
-        "UPDATE milestones SET status='funded',lock_until=NULL,review_lock=NULL WHERE id=$1 AND status='reviewing' AND evidence_version=$2 AND review_lock=$3",
-        [m.id, locked.evidence_version, reviewLock],
-      );
-    if (e instanceof HttpError) throw e;
-    throw new HttpError(
-      502,
-      "The AI review could not be completed. No payment was released.",
-    );
-  }
 }
 async function webhook(request: Request) {
   if (!process.env.PAYPAL_WEBHOOK_ID)

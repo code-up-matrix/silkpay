@@ -14,11 +14,9 @@ export async function api<T = Record<string, unknown>>(
       data === undefined ? undefined : multipart ? data : JSON.stringify(data),
     cache: "no-store",
   });
-  const result = await response
-    .json()
-    .catch(() => ({
-      error: "The service could not respond. Please try again.",
-    }));
+  const result = await response.json().catch(() => ({
+    error: "The service could not respond. Please try again.",
+  }));
   if (!response.ok)
     throw new Error(result.error || "The request could not be completed.");
   return result;

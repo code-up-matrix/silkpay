@@ -74,7 +74,7 @@ async function readResponse(response: Response) {
   }
   return value;
 }
-async function accessToken() {
+export async function getPayPalAccessToken() {
   if (cachedToken && cachedToken.expires > Date.now()) return cachedToken.token;
   const response = await fetch(PAYPAL_BASE + "/v1/oauth2/token", {
     method: "POST",
@@ -117,7 +117,7 @@ export async function paypal<T>(
     cache: "no-store",
     signal: AbortSignal.timeout(25000),
     headers: {
-      Authorization: "Bearer " + (await accessToken()),
+      Authorization: "Bearer " + (await getPayPalAccessToken()),
       "Content-Type": "application/json",
       Prefer: "return=representation",
       ...(key ? { "PayPal-Request-Id": key } : {}),
@@ -154,7 +154,7 @@ export function validateOrder(order: ProviderOrder, milestone: Milestone) {
   const unit = order.purchase_units?.[0];
   if (
     order.id !== milestone.paypal_order_id ||
-    order.intent !== "AUTHORIZE" ||
+    order.intent !== (milestone.payment_intent || "AUTHORIZE") ||
     order.purchase_units?.length !== 1 ||
     unit?.custom_id !== milestone.id ||
     unit.reference_id !== milestone.id ||
@@ -266,6 +266,93 @@ export async function capturePayment(m: Milestone) {
   );
   if (!matchesAmount(capture.amount, m.amount_cents))
     throw new HttpError(502, "PayPal returned a different capture amount.");
+  providerId(capture.id);
+  return capture;
+}
+
+/** Amount is integer cents from the database, never from the browser. */
+export async function createOrder(
+  amount: number,
+  currency: "USD",
+  context: { milestone: Milestone; order: PurchaseOrder },
+) {
+  const { milestone: m, order } = context;
+  if (amount !== m.amount_cents || currency !== "USD")
+    throw new HttpError(400, "The checkout must match the stored milestone.");
+  const origin = required("APP_ORIGIN");
+  const result = await paypal<ProviderOrder>(
+    "/v2/checkout/orders",
+    "POST",
+    {
+      intent: "CAPTURE",
+      purchase_units: [
+        {
+          reference_id: m.id,
+          custom_id: m.id,
+          description: (order.number + " · " + m.title).slice(0, 127),
+          amount: { currency_code: currency, value: decimalAmount(amount) },
+          payee: { merchant_id: required("PAYPAL_MERCHANT_ID") },
+        },
+      ],
+      payment_source: {
+        paypal: {
+          experience_context: {
+            brand_name: "SilkPay",
+            user_action: "PAY_NOW",
+            shipping_preference: "NO_SHIPPING",
+            return_url:
+              origin + "/payment/return?intent=CAPTURE&milestone=" + m.id,
+            cancel_url: origin + "/?payment=cancelled",
+          },
+        },
+      },
+    },
+    requestId("create-order", m.attempt_key),
+  );
+  providerId(result.id);
+  const url = result.links?.find(
+    (l) => l.rel === "payer-action" || l.rel === "approve",
+  )?.href;
+  if (!url) throw new HttpError(502, "PayPal did not provide a checkout link.");
+  return { id: result.id, url: safeApprovalUrl(url) };
+}
+
+/** Caller must first acquire the settlement lease and validate the current review. */
+export async function captureOrder(orderId: string, milestone: Milestone) {
+  if (
+    orderId !== milestone.paypal_order_id ||
+    milestone.payment_intent !== "CAPTURE"
+  )
+    throw new HttpError(409, "This checkout does not belong to the milestone.");
+  const before = await retrieveOrder(milestone);
+  if (before.status !== "APPROVED" && before.status !== "COMPLETED")
+    throw new HttpError(
+      409,
+      "Complete PayPal Sandbox approval before capture.",
+    );
+  const result = before.purchase_units[0].payments?.captures?.length
+    ? before
+    : await paypal<ProviderOrder>(
+        "/v2/checkout/orders/" + providerId(orderId) + "/capture",
+        "POST",
+        {},
+        requestId("capture-order", milestone.attempt_key),
+      );
+  const units = result.purchase_units;
+  const capture = units?.[0]?.payments?.captures?.[0];
+  // A capture response may omit custom_id and the purchase-unit amount.
+  // Their values were checked against GET /orders immediately before capture.
+  if (
+    result.id !== orderId ||
+    units?.length !== 1 ||
+    units[0].payments?.captures?.length !== 1 ||
+    !capture ||
+    !matchesAmount(capture.amount, milestone.amount_cents)
+  )
+    throw new HttpError(
+      502,
+      "PayPal did not confirm the exact milestone capture.",
+    );
   providerId(capture.id);
   return capture;
 }

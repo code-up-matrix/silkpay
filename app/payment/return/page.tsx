@@ -30,11 +30,20 @@ export default function PaymentReturn() {
       );
       return;
     }
-    api(`milestones/${encodeURIComponent(milestone)}/authorize`, { orderId })
+    api(
+      p.get("intent") === "CAPTURE"
+        ? "paypal/approve-order"
+        : `milestones/${encodeURIComponent(milestone)}/authorize`,
+      p.get("intent") === "CAPTURE"
+        ? { milestoneId: milestone, orderId }
+        : { orderId },
+    )
       .then(() => {
         setResult("success");
         setMessage(
-          "PayPal Sandbox confirmed the payment hold. Your supplier can now submit evidence for review. No settlement has been assumed.",
+          p.get("intent") === "CAPTURE"
+            ? "PayPal Sandbox confirmed checkout approval. Funds have not been captured or held. Submit supplier evidence, complete inspection, then confirm capture within the checkout window."
+            : "PayPal Sandbox confirmed the payment hold. Your supplier can now submit evidence for review. No settlement has been assumed.",
         );
         window.history.replaceState(null, "", "/payment/return");
       })
@@ -57,9 +66,9 @@ export default function PaymentReturn() {
       </div>
       <h1>
         {result === "loading"
-          ? "Confirming your authorization…"
+          ? "Confirming your checkout…"
           : result === "success"
-            ? "Your milestone is authorized."
+            ? "Your checkout is confirmed."
             : "Approval needs attention."}
       </h1>
       <p role="status">{message}</p>
